@@ -1,5 +1,5 @@
 {
-  "name": "VirtuHire - Autonomous Interviewer",
+  "name": "NOVA - Next-Gen Operational Virtual Assessment",
   "description": "An autonomous AI agent that conducts technical interviews, detects fraud, and provides hiring recommendations using Gemini Live API.",
   "requestFramePermissions": [
     "camera",

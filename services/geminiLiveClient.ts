@@ -7,6 +7,7 @@ interface LiveClientConfig {
   onTranscriptUpdate: (item: TranscriptItem) => void;
   onVolumeUpdate: (volume: number) => void;
   onDisconnect: () => void;
+  onSilenceTimeout?: () => void; // New callback for silence
 }
 
 export class GeminiLiveClient {
@@ -26,6 +27,12 @@ export class GeminiLiveClient {
   private sources = new Set<AudioBufferSourceNode>();
   private currentInputTranscription = '';
   private currentOutputTranscription = '';
+  
+  // Silence Detection
+  private lastUserActivityTime: number = 0;
+  private silenceCheckInterval: any = null;
+  // Increased to 15 minutes to prevent premature timeouts during thinking/drawing
+  private readonly SILENCE_TIMEOUT_MS = 15 * 60 * 1000; 
 
   constructor(config: LiveClientConfig) {
     this.config = config;
@@ -38,20 +45,24 @@ export class GeminiLiveClient {
     this.outputNode = this.outputAudioContext.createGain();
     this.outputNode.connect(this.outputAudioContext.destination);
 
+    // Initialize silence timer
+    this.lastUserActivityTime = Date.now();
+    this.startSilenceCheck();
+
     const sessionPromise = this.ai.live.connect({
       model: 'gemini-2.5-flash-native-audio-preview-09-2025',
       callbacks: {
         onopen: () => {
-          console.log("VirtuHire Connection Opened");
+          console.log("NOVA Connection Opened");
           this.startAudioInput(stream, sessionPromise);
         },
         onmessage: (msg) => this.handleMessage(msg),
         onclose: () => {
-          console.log("VirtuHire Connection Closed");
+          console.log("NOVA Connection Closed");
           this.config.onDisconnect();
         },
         onerror: (err) => {
-          console.error("VirtuHire Error", err);
+          console.error("NOVA Error", err);
           this.config.onDisconnect();
         }
       },
@@ -62,7 +73,6 @@ export class GeminiLiveClient {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Fenrir' } } // Fenrir sounds authoritative yet professional
         },
         // Corrected: Passing empty objects enables transcription. 
-        // Passing { model: ... } causes "Invalid Argument" error.
         inputAudioTranscription: {},
         outputAudioTranscription: {}
       }
@@ -71,13 +81,40 @@ export class GeminiLiveClient {
     this.session = await sessionPromise;
   }
 
+  private startSilenceCheck() {
+    this.silenceCheckInterval = setInterval(() => {
+      const timeSinceLastActivity = Date.now() - this.lastUserActivityTime;
+      if (timeSinceLastActivity > this.SILENCE_TIMEOUT_MS) {
+        console.warn("Silence timeout reached. Ending session.");
+        this.stopSilenceCheck();
+        if (this.config.onSilenceTimeout) {
+          this.config.onSilenceTimeout();
+        }
+      }
+    }, 5000); // Check every 5 seconds
+  }
+
+  private stopSilenceCheck() {
+    if (this.silenceCheckInterval) {
+      clearInterval(this.silenceCheckInterval);
+      this.silenceCheckInterval = null;
+    }
+  }
+
   private startAudioInput(stream: MediaStream, sessionPromise: Promise<any>) {
     if (!this.inputAudioContext) return;
+
+    // Ensure context is active to prevent dropped frames
+    if (this.inputAudioContext.state === 'suspended') {
+      this.inputAudioContext.resume().catch(console.error);
+    }
 
     this.inputSource = this.inputAudioContext.createMediaStreamSource(stream);
     this.processor = this.inputAudioContext.createScriptProcessor(4096, 1, 1);
 
     this.processor.onaudioprocess = (e) => {
+      if (!this.inputAudioContext) return;
+
       const inputData = e.inputBuffer.getChannelData(0);
       
       // Calculate volume for visualizer
@@ -86,10 +123,20 @@ export class GeminiLiveClient {
       const rms = Math.sqrt(sum / inputData.length);
       this.config.onVolumeUpdate(rms * 5); // Scale up for visibility
 
+      // Check for user activity (speaking) based on volume threshold
+      // LOWERED THRESHOLD: 0.002 (was 0.02) to detect quiet voices/bad mics
+      if (rms > 0.002) {
+        this.lastUserActivityTime = Date.now();
+      }
+
       const pcmBlob = createPcmBlob(inputData);
       
       sessionPromise.then(session => {
+        // DIRECT SESSION USAGE: Access session from promise result instead of this.session
+        // This prevents race conditions where this.session is not yet assigned.
         session.sendRealtimeInput({ media: pcmBlob });
+      }).catch(err => {
+        console.error("Error sending audio chunk:", err);
       });
     };
 
@@ -107,25 +154,31 @@ export class GeminiLiveClient {
 
         this.nextStartTime = Math.max(this.nextStartTime, this.outputAudioContext.currentTime);
         
-        const audioBytes = base64ToUint8Array(base64Audio);
-        const audioBuffer = await decodeAudioData(audioBytes, this.outputAudioContext, 24000, 1);
-        
-        const source = this.outputAudioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(this.outputNode);
-        source.addEventListener('ended', () => {
-          this.sources.delete(source);
-          this.config.onVolumeUpdate(0); // Reset volume
-        });
-        
-        source.start(this.nextStartTime);
-        this.nextStartTime += audioBuffer.duration;
-        this.sources.add(source);
+        try {
+          const audioBytes = base64ToUint8Array(base64Audio);
+          const audioBuffer = await decodeAudioData(audioBytes, this.outputAudioContext, 24000, 1);
+          
+          const source = this.outputAudioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(this.outputNode);
+          source.addEventListener('ended', () => {
+            this.sources.delete(source);
+            this.config.onVolumeUpdate(0); // Reset volume
+          });
+          
+          source.start(this.nextStartTime);
+          this.nextStartTime += audioBuffer.duration;
+          this.sources.add(source);
+        } catch (e) {
+          console.error("Error decoding audio", e);
+        }
     }
 
     // 2. Handle Interruption
     if (message.serverContent?.interrupted) {
-      this.sources.forEach(source => source.stop());
+      this.sources.forEach(source => {
+        try { source.stop(); } catch (e) {}
+      });
       this.sources.clear();
       this.nextStartTime = 0;
       this.config.onVolumeUpdate(0);
@@ -146,6 +199,8 @@ export class GeminiLiveClient {
           timestamp: Date.now()
         });
         this.currentInputTranscription = '';
+        // Explicitly update activity time on transcript received
+        this.lastUserActivityTime = Date.now();
       }
       if (this.currentOutputTranscription.trim()) {
         this.config.onTranscriptUpdate({
@@ -162,25 +217,54 @@ export class GeminiLiveClient {
     if (this.session) {
       // Clean base64 string if it contains headers
       const data = base64Image.replace(/^data:image\/(png|jpeg|webp);base64,/, '');
-      await this.session.sendRealtimeInput({
-        media: {
-          mimeType: 'image/jpeg',
-          data: data
-        }
-      });
+      try {
+        await this.session.sendRealtimeInput({
+          media: {
+            mimeType: 'image/jpeg',
+            data: data
+          }
+        });
+      } catch (e) {
+        console.error("Frame send error", e);
+      }
     }
   }
 
   async disconnect() {
-    // Close context
-    this.inputSource?.disconnect();
-    this.processor?.disconnect();
-    this.inputAudioContext?.close();
-    this.outputAudioContext?.close();
-    this.sources.forEach(s => s.stop());
+    this.stopSilenceCheck();
+
+    // 1. Disconnect Nodes
+    if (this.inputSource) {
+      try { this.inputSource.disconnect(); } catch (e) {}
+      this.inputSource = null;
+    }
+    if (this.processor) {
+      try { this.processor.disconnect(); } catch (e) {}
+      this.processor = null;
+    }
     
-    // We cannot explicitly close the session in the SDK, but we stop sending data
+    // 2. Close Contexts Safely
+    if (this.inputAudioContext) {
+      if (this.inputAudioContext.state !== 'closed') {
+        try { await this.inputAudioContext.close(); } catch (e) {}
+      }
+      this.inputAudioContext = null;
+    }
+
+    if (this.outputAudioContext) {
+      if (this.outputAudioContext.state !== 'closed') {
+         try { await this.outputAudioContext.close(); } catch (e) {}
+      }
+      this.outputAudioContext = null;
+    }
+
+    // 3. Stop Sources
+    this.sources.forEach(s => {
+      try { s.stop(); } catch (e) {}
+    });
+    this.sources.clear();
+    
+    // 4. Nullify session
     this.session = null;
-    this.config.onDisconnect();
   }
 }

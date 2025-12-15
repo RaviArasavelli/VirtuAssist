@@ -5,12 +5,12 @@ import react from '@vitejs/plugin-react'
 export default defineConfig(({ mode }) => {
   // Load env file based on `mode` in the current working directory.
   // Set the third parameter to '' to load all env regardless of the `VITE_` prefix.
-  const env = loadEnv(mode, process.cwd(), '')
+  const env = loadEnv(mode, '.', '')
 
   return {
     plugins: [react()],
-    // IMPORTANT: Replace 'VirtuHire' with your repository name if different
-    base: '/VirtuHire/', 
+    // Use relative path for base to support dynamic hosting sub-paths
+    base: './', 
     define: {
       // This enables process.env.API_KEY to work in the browser for the SDK
       'process.env.API_KEY': JSON.stringify(env.VITE_API_KEY)

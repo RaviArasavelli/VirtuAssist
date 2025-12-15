@@ -1,3 +1,4 @@
+
 export enum InterviewStatus {
   IDLE = 'IDLE',
   CONNECTING = 'CONNECTING',
@@ -12,6 +13,12 @@ export interface JobProfile {
   description: string;
   techStack: string[];
   softSkills: string[];
+}
+
+export interface CandidateProfile {
+  name: string;
+  email: string;
+  id: string;
 }
 
 export interface TranscriptItem {
